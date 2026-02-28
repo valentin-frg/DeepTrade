@@ -23,7 +23,16 @@ from prompt_builder import (
     fetch_and_cache_sentiment,
     get_account_snapshot,
     run_cycle,
+    build_exchange,
+    build_market_prompt,
+    build_account_prompt,
+    load_state,
 )
+from macro_strategist import (
+    MACRO_STRATEGY_CACHE_PATH,
+    fetch_and_cache_macro_strategy,
+)
+from gemini_client import get_cached_sentiment
 
 
 LOGGER = logging.getLogger("deeptrade.dash")
@@ -33,6 +42,7 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 DEFAULT_HISTORY_LIMIT = 20
 DEFAULT_SNAPSHOT_REFRESH = 60  # seconds
+DEFAULT_LOOP_INTERVAL = 60     # seconds between auto-cycle runs
 EMOJI_PATTERN = re.compile(r"[\U00010000-\U0010FFFF]")
 
 
@@ -47,7 +57,7 @@ class AppState:
         self.snapshot_status: str = ""
         self.cycle_status: str = ""
         self.loop_enabled: bool = False
-        self.loop_interval: int = 0
+        self.loop_interval: int = DEFAULT_LOOP_INTERVAL
         self.loop_running: bool = False
         self.loop_primed: bool = False
         self.grace_period_end: float = 0.0
@@ -280,16 +290,49 @@ def configure_sentiment_job() -> None:
         SCHEDULER.add_job(
             fetch_and_cache_sentiment,
             "interval",
-            minutes=30,
+            minutes=10,
             id=job_id,
             next_run_time=datetime.now(timezone.utc),
         )
-        LOGGER.info("Sentiment background job scheduled (every 30m).")
+        LOGGER.info("Sentiment background job scheduled (every 10m).")
+
+
+def macro_strategy_job() -> None:
+    """Wrapper executed by the scheduler: builds live market data and calls the macro strategist."""
+    try:
+        exchange = build_exchange()
+        state = load_state()
+        try:
+            market_data = build_market_prompt(exchange)
+            account_prompt, _, _ = build_account_prompt(exchange, state)
+        finally:
+            try:
+                exchange.close()
+            except Exception:  # noqa: BLE001
+                pass
+        sentiment = get_cached_sentiment()
+        fetch_and_cache_macro_strategy(market_data, account_prompt, sentiment)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Macro strategy job failed: %s", exc)
+
+
+def configure_macro_strategy_job() -> None:
+    job_id = "macro_strategy_job"
+    if not SCHEDULER.get_job(job_id):
+        SCHEDULER.add_job(
+            macro_strategy_job,
+            "interval",
+            hours=1,
+            id=job_id,
+            next_run_time=datetime.now(timezone.utc),
+        )
+        LOGGER.info("Macro strategy job scheduled (every 1h).")
 
 
 configure_auto_cycle_job()
 configure_snapshot_job()
 configure_sentiment_job()
+configure_macro_strategy_job()
 
 
 app = Dash(__name__)
@@ -478,6 +521,123 @@ def _strip_emoji(value: Optional[Any]) -> str:
     return EMOJI_PATTERN.sub("", str(value))
 
 
+def _build_ai_explanation(history: List[Dict[str, Any]]) -> List[Any]:
+    """Build a clean AI reasoning view from the latest cycle."""
+    if not history:
+        return [html.Div("No cycles run yet. Start a trading cycle to see the AI reasoning.", className="muted")]
+
+    entry = history[-1]  # Most recent cycle
+    timestamp = entry.get("run_timestamp", "")
+    readable = "Unknown time"
+    if timestamp:
+        try:
+            readable = datetime.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            readable = timestamp
+
+    decisions = entry.get("decisions") or {}
+    chain = _strip_emoji(entry.get("chain_of_thought") or "")
+
+    # --- Decision cards per coin ---
+    decision_cards = []
+    signal_colors = {
+        "buy_to_enter": "#22c55e",
+        "sell_to_enter": "#fb7185",
+        "close_position": "#facc15",
+        "hold": "rgba(255,255,255,0.4)",
+        "do_nothing": "rgba(255,255,255,0.2)",
+    }
+    for coin, payload in decisions.items():
+        args = payload.get("trade_signal_args", {})
+        signal = args.get("signal", "unknown")
+        color = signal_colors.get(signal, "rgba(255,255,255,0.3)")
+        confidence = args.get("confidence")
+        leverage = args.get("leverage")
+        risk_pct = args.get("risk_percentage")
+        justification = _strip_emoji(args.get("justification") or "")
+        exit_plan = args.get("exit_plan") or {}
+
+        meta_items = []
+        if confidence is not None:
+            meta_items.append(f"Confidence: {float(confidence):.0%}")
+        if leverage is not None:
+            meta_items.append(f"Leverage: {leverage}×")
+        if risk_pct is not None:
+            meta_items.append(f"Risk: {risk_pct}%")
+        if exit_plan.get("profit_target"):
+            meta_items.append(f"TP: {exit_plan['profit_target']}")
+        if exit_plan.get("stop_loss"):
+            meta_items.append(f"SL: {exit_plan['stop_loss']}")
+
+        card_children = [
+            html.Div([
+                html.Span(coin.upper(), style={"fontWeight": "700", "fontSize": "1.05rem"}),
+                html.Span(
+                    signal.replace("_", " ").upper(),
+                    style={
+                        "color": color,
+                        "fontWeight": "600",
+                        "fontSize": "0.8rem",
+                        "letterSpacing": "0.12em",
+                        "marginLeft": "auto",
+                        "padding": "0.25rem 0.75rem",
+                        "borderRadius": "999px",
+                        "border": f"1px solid {color}",
+                    }
+                ),
+            ], style={"display": "flex", "alignItems": "center", "gap": "1rem", "marginBottom": "0.75rem"}),
+        ]
+        if meta_items:
+            card_children.append(
+                html.Div(" · ".join(meta_items), style={"fontSize": "0.8rem", "color": "rgba(255,255,255,0.55)", "marginBottom": "0.5rem", "letterSpacing": "0.05em"})
+            )
+        if justification:
+            card_children.append(
+                html.P(justification, style={"fontSize": "0.9rem", "color": "rgba(255,255,255,0.75)", "margin": "0.5rem 0 0"})
+            )
+        if exit_plan.get("invalidation_condition"):
+            card_children.append(
+                html.P(
+                    [html.Strong("Invalidation: "), _strip_emoji(exit_plan["invalidation_condition"])],
+                    style={"fontSize": "0.85rem", "color": "rgba(251,113,133,0.9)", "marginTop": "0.5rem"}
+                )
+            )
+
+        decision_cards.append(
+            html.Div(card_children, style={
+                "background": "rgba(255,255,255,0.03)",
+                "border": "1px solid rgba(255,255,255,0.08)",
+                "borderRadius": "16px",
+                "padding": "1.25rem 1.5rem",
+            })
+        )
+
+    if not decision_cards:
+        decision_cards = [html.Div("No decisions in this cycle.", className="muted")]
+
+    sections = [
+        html.Div([
+            html.Span(f"Latest cycle — {readable}", style={"fontWeight": "600", "fontSize": "1rem"}),
+            html.Span(f"Cycle #{entry.get('invocation_count', '?')} · {entry.get('minutes_since_start', '?')}m since start",
+                      style={"fontSize": "0.8rem", "color": "rgba(255,255,255,0.45)", "marginLeft": "1rem"}),
+        ], style={"marginBottom": "1.5rem", "paddingBottom": "1rem", "borderBottom": "1px solid rgba(255,255,255,0.08)"}),
+
+        html.H3("Decisions", style={"marginBottom": "1rem"}),
+        html.Div(decision_cards, style={"display": "grid", "gap": "1rem",
+                                       "gridTemplateColumns": "repeat(auto-fill, minmax(300px, 1fr))",
+                                       "marginBottom": "2rem"}),
+    ]
+
+    if chain:
+        sections += [
+            html.H3("Chain of Thought", style={"marginBottom": "0.75rem"}),
+            html.Pre(chain, className="code-block",
+                     style={"maxHeight": "500px", "overflowY": "auto", "fontSize": "0.82rem", "lineHeight": "1.7"}),
+        ]
+
+    return sections
+
+
 app.layout = html.Div(
     id="app-shell",
     className="app-shell theme-dark",
@@ -559,6 +719,19 @@ app.layout = html.Div(
                         ],
                     ),
                     dcc.Tab(
+                        label="AI Explanation",
+                        value="ai-explanation",
+                        className="deeptrade-tab",
+                        selected_className="deeptrade-tab--active",
+                        children=[
+                            html.Div(
+                                id="ai-explanation-content",
+                                className="panel panel--wide",
+                                children=[html.Div("Loading...", className="muted")],
+                            ),
+                        ],
+                    ),
+                    dcc.Tab(
                         label="Trade History",
                         value="trades",
                         className="deeptrade-tab",
@@ -588,10 +761,10 @@ app.layout = html.Div(
                                     dcc.Input(
                                         id="loop-interval-input",
                                         type="number",
-                                        min=0,
+                                        min=10,
                                         max=3600,
                                         step=1,
-                                        placeholder="Loop interval (seconds)",
+                                        placeholder=f"Loop interval (seconds, default {DEFAULT_LOOP_INTERVAL})",
                                         className="input-field",
                                     ),
                                     html.Div(id="grace-period-info", className="muted"),
@@ -710,6 +883,7 @@ def handle_save_settings(
     Output("snapshot-interval-input", "value"),
     Output("sentiment-display", "children"),
     Output("sentiment-timestamp", "children"),
+    Output("ai-explanation-content", "children"),
     Input("refresh-interval", "n_intervals"),
 )
 def update_ui(n_intervals: int):
@@ -780,6 +954,8 @@ def update_ui(n_intervals: int):
         except Exception:  # noqa: BLE001
             sentiment_display = dcc.Markdown("Unable to load sentiment snapshot.")
 
+    ai_explanation = _build_ai_explanation(history)
+
     return (
         _strip_emoji(snapshot.get("snapshot_status", "")),
         _strip_emoji(snapshot.get("cycle_status", "")),
@@ -800,6 +976,7 @@ def update_ui(n_intervals: int):
         snapshot.get("snapshot_refresh_interval"),
         sentiment_display,
         sentiment_time,
+        ai_explanation,
     )
 
 if __name__ == "__main__":
