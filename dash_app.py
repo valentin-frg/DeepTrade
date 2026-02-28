@@ -8,6 +8,7 @@ import time
 from collections import deque
 from dataclasses import asdict
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional
 
@@ -31,8 +32,15 @@ from prompt_builder import (
 from macro_strategist import (
     MACRO_STRATEGY_CACHE_PATH,
     fetch_and_cache_macro_strategy,
+    get_cached_macro_strategy,
 )
-from gemini_client import get_cached_sentiment
+from sentiment_analyst import get_cached_sentiment, get_cached_sentiment_json, fetch_and_cache_sentiment as _fetch_sentiment
+from sentinelle import run_sentinelle
+from circuit_breaker import (
+    is_emergency_active,
+    get_emergency_info,
+    clear_emergency,
+)
 
 
 LOGGER = logging.getLogger("deeptrade.dash")
@@ -41,17 +49,45 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 DEFAULT_HISTORY_LIMIT = 20
+CYCLE_HISTORY_LIMIT = 10        # number of cycles persisted to disk
+CYCLE_HISTORY_PATH = Path("cycle_history.json")
 DEFAULT_SNAPSHOT_REFRESH = 60  # seconds
 DEFAULT_LOOP_INTERVAL = 60     # seconds between auto-cycle runs
 EMOJI_PATTERN = re.compile(r"[\U00010000-\U0010FFFF]")
 
+
+def _persist_cycle_history() -> None:
+    """Write the last CYCLE_HISTORY_LIMIT cycles to disk for external agent consumption."""
+    try:
+        history = list(STATE.history)[-CYCLE_HISTORY_LIMIT:]
+        temp_path = CYCLE_HISTORY_PATH.with_suffix(".tmp")
+        with temp_path.open("w", encoding="utf-8") as fh:
+            json.dump(history, fh, indent=2, ensure_ascii=False, default=str)
+        temp_path.replace(CYCLE_HISTORY_PATH)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Failed to persist cycle history: %s", exc)
+
+
+def _load_cycle_history() -> List[Dict[str, Any]]:
+    """Load persisted cycle history from disk at startup."""
+    if not CYCLE_HISTORY_PATH.exists():
+        return []
+    try:
+        with CYCLE_HISTORY_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            return data
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Failed to load cycle history from disk: %s", exc)
+    return []
 
 class AppState:
     """Thread-safe container for dashboard state."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self.history: deque[Dict[str, Any]] = deque(maxlen=DEFAULT_HISTORY_LIMIT)
+        _prior = _load_cycle_history()
+        self.history: deque[Dict[str, Any]] = deque(_prior, maxlen=DEFAULT_HISTORY_LIMIT)
         self.last_snapshot: Optional[Dict[str, Any]] = None
         self.last_snapshot_refreshed_at: Optional[str] = None
         self.snapshot_status: str = ""
@@ -107,6 +143,9 @@ def _format_local_timestamp(ts: datetime) -> str:
     return local_ts.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+
+
+
 def _record_result(result) -> None:
     STATE.append_history(asdict(result))
     STATE.update(
@@ -116,6 +155,7 @@ def _record_result(result) -> None:
             "balances": result.balances_after,
         }
     )
+    _persist_cycle_history()
 
 
 def _cycle_worker(source: str) -> None:
@@ -139,6 +179,12 @@ def _cycle_worker(source: str) -> None:
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Error during trading cycle")
         STATE.update(cycle_status=f"{source} trading cycle failed: {exc}")
+        # If the cycle triggered emergency mode, halt the auto-loop immediately
+        if is_emergency_active():
+            STATE.update(loop_enabled=False, loop_primed=False)
+            LOGGER.critical(
+                "Auto-loop disabled: emergency mode activated during cycle."
+            )
     finally:
         STATE.update(loop_running=False)
         if MANUAL_CYCLE_THREAD and threading.current_thread() is MANUAL_CYCLE_THREAD:
@@ -166,6 +212,10 @@ def manual_cycle() -> bool:
 
 
 def auto_cycle_tick() -> None:
+    # Refuse to run if emergency mode is active
+    if is_emergency_active():
+        STATE.update(loop_enabled=False, loop_primed=False)
+        return
     snapshot = STATE.snapshot()
     if not snapshot["loop_enabled"] or not snapshot["loop_primed"]:
         return
@@ -284,17 +334,92 @@ def configure_snapshot_job() -> None:
             SCHEDULER.remove_job("snapshot_refresh_job")
 
 
+def sentiment_then_sentinelle_job() -> None:
+    """
+    Wrapper scheduled every 5 minutes:
+    1. Refresh the sentiment cache (Gemini + Google Search).
+    2. Run La Sentinelle (CRO audit).
+    3. If the Sentinelle triggers a recalculation, immediately run the macro strategist.
+    """
+    # Step 1 — refresh sentiment
+    _fetch_sentiment()
+
+    # Step 2 — audit with La Sentinelle
+    try:
+        exchange = build_exchange()
+        state = load_state()
+        try:
+            market_data = build_market_prompt(exchange)
+            account_prompt, _, _ = build_account_prompt(exchange, state)
+        finally:
+            try:
+                exchange.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        sentiment = get_cached_sentiment()
+        macro_strategy = get_cached_macro_strategy()
+
+        # Check if the Sentiment Analyst already flagged a black swan — add it as context
+        sentiment_json = get_cached_sentiment_json()
+        black_swan_pre_flag = ""
+        if sentiment_json:
+            bsa = sentiment_json.get("black_swan_alert", {})
+            if bsa.get("triggered"):
+                urgency = bsa.get("urgency_message", "Black swan detected by Sentiment Analyst.")
+                black_swan_pre_flag = f"⚠️ PRE-ALERT FROM SENTIMENT ANALYST: {urgency}"
+                LOGGER.warning("Sentiment Analyst flagged a black swan: %s", urgency)
+
+        sentinelle_market = (black_swan_pre_flag + "\n\n" + market_data) if black_swan_pre_flag else market_data
+
+        decision = run_sentinelle(
+            market_data=sentinelle_market,
+            sentiment=sentiment,
+            macro_strategy=macro_strategy,
+        )
+
+        # Step 3 — trigger emergency macro recalculation if needed
+        if decision.get("trigger_recalculation"):
+            LOGGER.warning(
+                "Sentinelle triggered emergency macro recalculation! "
+                "Confidence: %s | Reason: %s",
+                decision.get("confidence_in_alarm"),
+                decision.get("reasoning_for_logs"),
+            )
+            # Pass the Sentinelle's emergency message to the macro strategist
+            emergency_note = decision.get("message_to_macro_strategist") or ""
+            fetch_and_cache_macro_strategy(
+                market_data,
+                account_prompt,
+                sentiment,
+                emergency_note=emergency_note,
+            )
+            # Reset the hourly scheduler: next normal run = 1h from NOW
+            # so the CIO gets a full fresh hour after the emergency recalculation.
+            macro_job = SCHEDULER.get_job("macro_strategy_job")
+            if macro_job:
+                SCHEDULER.reschedule_job(
+                    "macro_strategy_job",
+                    trigger=IntervalTrigger(hours=1),
+                    next_run_time=datetime.now(timezone.utc) + timedelta(hours=1),
+                )
+                LOGGER.info("Macro strategy job rescheduled: next run in 1h from emergency trigger.")
+
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Sentinelle job failed: %s", exc)
+
+
 def configure_sentiment_job() -> None:
     job_id = "gemini_sentiment_job"
     if not SCHEDULER.get_job(job_id):
         SCHEDULER.add_job(
-            fetch_and_cache_sentiment,
+            sentiment_then_sentinelle_job,
             "interval",
-            minutes=10,
+            minutes=5,
             id=job_id,
             next_run_time=datetime.now(timezone.utc),
         )
-        LOGGER.info("Sentiment background job scheduled (every 10m).")
+        LOGGER.info("Sentiment+Sentinelle job scheduled (every 5m).")
 
 
 def macro_strategy_job() -> None:
@@ -646,6 +771,25 @@ app.layout = html.Div(
             html.Div([
                 html.H1("DeepTrade Control Panel"),
             ], className="header-bar"),
+            # ── Emergency Banner (hidden when no emergency) ───────────────
+            html.Div(
+                id="emergency-banner",
+                style={"display": "none"},
+                className="emergency-banner",
+                children=[
+                    html.Span("⛔ EMERGENCY MODE ACTIVE — Bot halted. All positions closed."),
+                    html.Span(id="emergency-reason", style={"marginLeft": "1rem", "fontStyle": "italic"}),
+                    html.Button(
+                        "✅ Reset & Resume",
+                        id="clear-emergency-btn",
+                        n_clicks=0,
+                        className="action-btn",
+                        style={"marginLeft": "2rem", "background": "#fff", "color": "#b00020"},
+                    ),
+                ],
+            ),
+            html.Div(id="clear-emergency-feedback", className="feedback"),
+            # ─────────────────────────────────────────────────────────────
             dcc.Interval(id="refresh-interval", interval=4000, n_intervals=0),
             dcc.Tabs(
                 id="tabs",
@@ -800,6 +944,37 @@ app.layout = html.Div(
         ], className="app-content", style={"minHeight": "100vh"}),
     ]
 )
+
+
+@app.callback(
+    Output("emergency-banner", "style"),
+    Output("emergency-reason", "children"),
+    Input("refresh-interval", "n_intervals"),
+)
+def update_emergency_banner(n_intervals):
+    """Show / hide the emergency banner based on circuit-breaker state."""
+    if is_emergency_active():
+        info = get_emergency_info() or {}
+        reason = info.get("reason", "Unknown reason")
+        triggered_at = info.get("triggered_at", "")
+        return (
+            {"display": "flex", "alignItems": "center", "padding": "1rem",
+             "background": "#b00020", "color": "#fff", "fontWeight": "bold",
+             "borderRadius": "8px", "margin": "1rem"},
+            f"{reason} (at {triggered_at})",
+        )
+    return {"display": "none"}, ""
+
+
+@app.callback(
+    Output("clear-emergency-feedback", "children"),
+    Input("clear-emergency-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def handle_clear_emergency(n_clicks: int) -> str:
+    """Clear emergency mode — allows the operator to resume trading."""
+    clear_emergency()
+    return "✅ Emergency cleared. You can restart trading manually."
 
 
 @app.callback(

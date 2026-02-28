@@ -20,12 +20,13 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-from gemini_client import (
+from sentiment_analyst import (
     SENTIMENT_CACHE_PATH,
     fetch_and_cache_sentiment,
     get_cached_sentiment,
 )
 from macro_strategist import get_cached_macro_strategy
+from circuit_breaker import is_emergency_active, emergency_shutdown
 
 # --- Constants & Paths ---
 COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "DOGE/USDT"]
@@ -35,7 +36,7 @@ INTRADAY_BARS = 10
 LONGTERM_BARS = 10
 SYSTEM_PROMPT_FILENAME = "system_prompt.md"
 STATE_PATH = Path("bot_state.json")
-SENTIMENT_CACHE_PATH = SENTIMENT_CACHE_PATH  # re-exported from gemini_client
+SENTIMENT_CACHE_PATH = SENTIMENT_CACHE_PATH  # re-exported from sentiment_analyst
 DEFAULT_SLEEP = 1.5
 MAX_DEEPSEEK_RETRIES = 3
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
@@ -841,6 +842,16 @@ def reconcile_state(state: Dict[str, Any], live_positions: Dict[str, Dict[str, A
 def run_cycle() -> RunCycleResult:
     global _progress_thread, _progress_stop
 
+    # ── Circuit-breaker guard ─────────────────────────────────────────────
+    if is_emergency_active():
+        from circuit_breaker import get_emergency_info
+        info = get_emergency_info() or {}
+        raise RuntimeError(
+            f"EMERGENCY MODE ACTIVE — bot halted. Reason: {info.get('reason', 'unknown')}. "
+            "Clear emergency_state.json to resume."
+        )
+    # ─────────────────────────────────────────────────────────────────────
+
     consume_logs()
     state = load_state()
     exchange = build_exchange()
@@ -909,30 +920,15 @@ def run_cycle() -> RunCycleResult:
             response = client.request(system_prompt, user_prompt)
             log_section("LLM CALL", "DeepSeek response received successfully")
         except Exception as exc:  # noqa: BLE001
-            log_section("LLM ERROR", f"DeepSeek request failed after retries: {exc}")
+            reason = f"DeepSeek LLM unreachable after all retries: {exc}"
+            log_section("LLM ERROR", reason)
             save_state(state)
+            emergency_shutdown(exchange=exchange, reason=reason, state=state)
             logs = consume_logs()
-            return RunCycleResult(
-                user_prompt=user_prompt,
-                system_prompt=system_prompt,
-                llm_raw="",
-                chain_of_thought=None,
-                decisions={},
-                final_content="",
-                summary=None,
-                account_prompt_before=account_prompt_before,
-                account_prompt_after=account_prompt_before,
-                positions_before=positions_before,
-                positions_after=positions_before,
-                balances_before=balances_before,
-                balances_after=balances_before,
-                logs=logs,
-                minutes_since_start=minutes_since_start,
-                invocation_count=invocation_count,
-                run_timestamp=current_time.isoformat(),
-            )
+            raise RuntimeError(reason) from exc
         finally:
             log_section("LLM CALL", "DeepSeek request finished")
+
 
         log_section("LLM RAW", response.raw_text)
         log_section(

@@ -16,6 +16,10 @@ MACRO_STRATEGY_CACHE_PATH = Path("macro_strategy_cache.json")
 MACRO_STRATEGIST_PROMPT = """You are the Chief Quantitative Strategist (Chief Investment Officer) of an elite crypto hedge fund. Your exclusive role is to analyze global market data and define the trading strategy for the next hour.
 You do not place orders directly. You dictate directives to your Tactical Execution Agent, a high-frequency algorithm operating on 1-minute charts (M1). Your agent is forbidden from contradicting your bias — it will only seek the best M1 entry point based on your rules.
 
+OPERATING CYCLE:
+- Under normal conditions, you define a new strategy ONCE PER HOUR. Your directive governs the entire hour and the Tactical Agent executes within your framework.
+- EXCEPTION — EMERGENCY RECALCULATION: Your Chief Risk Officer (CRO), the Sentinelle AI, monitors the market every 5 minutes. If it detects a black swan event, a fundamental news shock, or abnormal tactical drawdown, it will interrupt the normal cycle and summon you for an emergency recalculation BEFORE the hour is up. In this case, the data you receive will begin with a block marked "⚠️ URGENCE — MESSAGE DE LA SENTINELLE (CRO)". You MUST treat this message as your absolute highest priority: it overrides your previous strategy entirely. Produce a new strategy that directly addresses the risk or opportunity flagged by the CRO.
+
 YOUR OBJECTIVES:
 - Define the Bias: Is the market BULLISH (LONG), BEARISH (SHORT), or RANGING/UNCERTAIN (NEUTRAL) for the next hour?
 - Protect Capital: You MUST define an invalidation_price. This is the exact price level that, if breached, proves your strategy is wrong and will trigger an emergency circuit-breaker cancelling all operations.
@@ -24,6 +28,7 @@ YOUR OBJECTIVES:
 ANALYSIS RULES:
 - Prioritize capital preservation. If the market is too volatile, erratic, or without a clear trend, your bias MUST be "NEUTRAL". (In this case, the Tactical Agent will remain inactive.)
 - Do not be distracted by short-term noise. Focus on liquidity, momentum (RSI/MACD macro), and key support/resistance levels.
+- If this is an emergency recalculation triggered by the CRO, explicitly acknowledge the CRO's concern in your rationale field.
 
 MANDATORY RESPONSE FORMAT:
 You MUST respond ONLY with a valid JSON object, with no text before or after it, and no markdown fences (no ```json). The system will parse your response directly.
@@ -50,11 +55,11 @@ Here is the current financial and qualitative data to analyze. You must base you
 """
 
 
-def fetch_and_cache_macro_strategy(market_data: str, account_data: str, sentiment: str = "") -> None:
+def fetch_and_cache_macro_strategy(market_data: str, account_data: str, sentiment: str = "", emergency_note: str = "") -> None:
     """
     Sends the full market context to Gemini thinking model to produce a
     macro strategic directive. Result is cached to disk.
-    Called once per hour by the scheduler.
+    Called once per hour by the scheduler, or immediately by the Sentinelle.
     """
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -65,6 +70,9 @@ def fetch_and_cache_macro_strategy(market_data: str, account_data: str, sentimen
 
         # Assemble the full data blob — same content as the DeepSeek user prompt
         data_blob = ""
+        if emergency_note:
+            data_blob += "--- ⚠️ URGENCE — MESSAGE DE LA SENTINELLE (CRO) ---\n"
+            data_blob += emergency_note.strip() + "\n\n"
         if sentiment:
             data_blob += "--- QUALITATIVE ANALYSIS OF THE CURRENT CRYPTO ENVIRONMENT ---\n"
             data_blob += sentiment.strip() + "\n\n"
@@ -73,17 +81,16 @@ def fetch_and_cache_macro_strategy(market_data: str, account_data: str, sentimen
         data_blob += "\n\n"
         data_blob += account_data
 
-        full_prompt = MACRO_STRATEGIST_PROMPT + data_blob
-
         contents = [
             types.Content(
                 role="user",
-                parts=[types.Part.from_text(text=full_prompt)],
+                parts=[types.Part.from_text(text=data_blob)],
             )
         ]
         # Use the best available Gemini model for deep strategic reasoning
         config = types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_budget=8000),
+            system_instruction=MACRO_STRATEGIST_PROMPT,
+            thinking_config=types.ThinkingConfig(thinking_budget=-1),
         )
 
         response = client.models.generate_content(
