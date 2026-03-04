@@ -1,0 +1,9 @@
+[
+  {
+    "timestamp": "2026-03-04T15:25:13.764537+00:00",
+    "trigger_recalculation": true,
+    "confidence_in_alarm": 100,
+    "reasoning_for_logs": "Absence totale de stratégie macroéconomique active. Un calcul initial est obligatoirement requis pour définir le biais directionnel et les limites de risques, d'autant plus face à un choc fondamental positif (inflows massifs ETF BTC, découplage crypto/TradFi).",
+    "message_to_macro_strategist": "ALERTE CRITIQUE : Aucune stratégie macro n'est actuellement définie. Le marché présente un contexte atypique avec un découplage haussier fort de la crypto (inflows ETF BTC de +458M$, record de volume on-chain SOL) face à un environnement TradFi risk-off (DXY à 99, SPX en baisse). Calculez immédiatement une stratégie directionnelle pour encadrer l'Agent d'Exécution."
+  }
+]

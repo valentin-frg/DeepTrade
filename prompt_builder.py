@@ -29,8 +29,9 @@ from macro_strategist import get_cached_macro_strategy
 from circuit_breaker import is_emergency_active, emergency_shutdown
 
 # --- Constants & Paths ---
-COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "DOGE/USDT"]
-INTRADAY_TIMEFRAME = "3m"
+# Kraken Futures — USD linear perpetuals (CCXT swap format)
+COINS = ["BTC/USD:USD", "ETH/USD:USD", "SOL/USD:USD", "XRP/USD:USD", "DOGE/USD:USD"]
+INTRADAY_TIMEFRAME = "5m"  # Kraken: 1m 5m 15m 30m 1h 4h 12h 1d 1w (no 3m)
 LONGTERM_TIMEFRAME = "4h"
 INTRADAY_BARS = 10
 LONGTERM_BARS = 10
@@ -136,10 +137,13 @@ def symbol_to_coin(symbol: str) -> str:
 
 
 def coin_to_symbol(coin: str) -> str:
+    """Return the CCXT unified swap symbol for a given base coin name."""
     coin = coin.upper()
-    if "/" in coin:
-        return coin
-    return f"{coin}/USDT"
+    if ":" in coin:
+        return coin  # Already in swap format
+    if "/" in coin and ":" not in coin:
+        return coin + ":USD"
+    return f"{coin}/USD:USD"
 
 
 def extract_json_block(text: str) -> Dict[str, Any]:
@@ -219,11 +223,11 @@ def build_market_prompt(exchange: ccxt.Exchange) -> str:
 
     public_derivatives = getattr(build_market_prompt, "_public_derivatives", None)
     if public_derivatives is None:
-        public_derivatives = ccxt.binance({"options": {"defaultType": "future"}})
+        public_derivatives = ccxt.krakenfutures({"enableRateLimit": True})
         try:
             public_derivatives.load_markets()
         except Exception as exc:  # noqa: BLE001
-            log_section("WARNING", f"Failed to load mainnet markets for derivatives data: {exc}")
+            log_section("WARNING", f"Failed to load Kraken Futures markets for derivatives data: {exc}")
         build_market_prompt._public_derivatives = public_derivatives
 
     for symbol in COINS:
@@ -340,76 +344,41 @@ def build_market_prompt(exchange: ccxt.Exchange) -> str:
 
 
 def fetch_account_position_map(exchange: ccxt.Exchange) -> Dict[str, Dict[str, Any]]:
+    """Return open positions keyed by base coin, using CCXT normalised fields."""
     raw_positions = exchange.fetch_positions()
     positions: Dict[str, Dict[str, Any]] = {}
     for entry in raw_positions:
-        info = entry.get("info", {})
-        # positionAmt from Binance raw API is signed: positive for LONG, negative for SHORT.
-        # We prefer it over ccxt's normalized `contracts` which is always positive.
-        raw_pos_amt = info.get("positionAmt")
-        if raw_pos_amt is not None:
-            contracts = float(raw_pos_amt)
-        else:
-            contracts = float(entry.get("contracts") or 0)
-        if not contracts:
+        contracts_raw = float(entry.get("contracts") or 0)
+        if not contracts_raw:
             continue
         symbol = entry.get("symbol")
         if not symbol:
             continue
+        # Derive sign from CCXT-normalised side field ("long" / "short")
+        side = (entry.get("side") or "").lower()
+        contracts = contracts_raw if side == "long" else -contracts_raw
         coin = symbol_to_coin(symbol)
+        info = entry.get("info", {})
         positions[coin] = {
             "symbol": symbol,
             "contracts": contracts,  # signed: positive = LONG, negative = SHORT
             "entry_price": float(entry.get("entryPrice") or info.get("entryPrice") or 0),
             "mark_price": float(entry.get("markPrice") or info.get("markPrice") or 0),
-            "liquidation_price": float(info.get("liquidationPrice") or 0),
+            "liquidation_price": float(
+                entry.get("liquidationPrice") or info.get("liquidationPrice") or 0
+            ),
             "leverage": int(entry.get("leverage") or info.get("leverage") or 0),
-            "unrealized_pnl": float(entry.get("unrealizedPnl") or info.get("unRealizedProfit") or 0),
+            "unrealized_pnl": float(entry.get("unrealizedPnl") or info.get("unrealizedPnl") or 0),
         }
     return positions
 
 
 def build_account_prompt(exchange: ccxt.Exchange, state: Dict[str, Any]) -> tuple[str, Dict[str, Dict[str, Any]], Dict[str, Any]]:
     balance = exchange.fetch_balance()
-    total_balance = balance.get("total", {}).get("USDT", 0)
-    available_cash = balance.get("free", {}).get("USDT", 0)
-    margin_balance = total_balance
-
-    info = balance.get("info")
-    # Binance futures returns a list of asset dicts; prefer their richer fields when present
-    assets = None
-    if isinstance(info, dict):
-        assets = info.get("assets") or info.get("balances")
-        if isinstance(assets, dict):  # Some CCXT versions return mapping keyed by asset
-            assets = list(assets.values())
-    elif isinstance(info, list):
-        assets = info
-
-    if isinstance(assets, list):
-        for entry in assets:
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("asset") != "USDT":
-                continue
-            available_cash = float(
-                entry.get("availableBalance")
-                or entry.get("available")
-                or entry.get("free")
-                or available_cash
-            )
-            total_balance = float(
-                entry.get("balance")
-                or entry.get("walletBalance")
-                or entry.get("crossWalletBalance")
-                or total_balance
-            )
-            margin_balance = float(
-                entry.get("marginBalance")
-                or entry.get("margin_balance")
-                or entry.get("crossMarginBalance")
-                or margin_balance
-            )
-            break
+    # Use CCXT-normalised balance fields (Kraken Futures compatible)
+    total_balance = float(balance.get("total", {}).get("USDT", 0))
+    available_cash = float(balance.get("free", {}).get("USDT", 0))
+    margin_balance = float(balance.get("used", {}).get("USDT", total_balance))
     starting_capital = state.get("starting_capital", 5000)
     pnl_percent = 0.0
     if starting_capital:
@@ -564,14 +533,13 @@ def place_bracket_orders(
     try:
         sl_order = exchange.create_order(
             symbol,
-            "STOP_MARKET",
+            "stop_market",
             reduce_side,
             amount,
             None,
             {
                 "stopPrice": ensure_price_precision(exchange, symbol, stop_loss),
                 "reduceOnly": True,
-                "workingType": "MARK_PRICE",
             },
         )
         orders["stop_loss"] = sl_order.get("id")
@@ -583,14 +551,13 @@ def place_bracket_orders(
     try:
         tp_order = exchange.create_order(
             symbol,
-            "TAKE_PROFIT_MARKET",
+            "take_profit_market",
             reduce_side,
             amount,
             None,
             {
                 "stopPrice": ensure_price_precision(exchange, symbol, take_profit),
                 "reduceOnly": True,
-                "workingType": "MARK_PRICE",
             },
         )
         orders["take_profit"] = tp_order.get("id")
@@ -614,16 +581,13 @@ def send_market_order(
             side,
             amount,
             None,
-            {
-                "reduceOnly": False,
-                "newOrderRespType": "RESULT",
-            },
+            {"reduceOnly": False},
         )
         log_section("ORDERS", f"Executed market order {order.get('id')} on {symbol}")
         return order
     except ExchangeError as exc:
         message = str(exc)
-        if "Margin is insufficient" in message:
+        if any(k in message for k in ("Margin is insufficient", "insufficient", "margin")):
             log_section("ERROR", f"Entry rejected for {symbol}: {message}")
             return None
         raise
@@ -645,16 +609,13 @@ def close_position(
             side,
             amount,
             None,
-            {
-                "reduceOnly": True,
-                "newOrderRespType": "RESULT",
-            },
+            {"reduceOnly": True},
         )
         log_section("ORDERS", f"Closed position with order {order.get('id')} on {symbol}")
         return order
     except ExchangeError as exc:
         message = str(exc)
-        if "ReduceOnly Order is rejected" in message:
+        if any(k in message for k in ("ReduceOnly", "reduce_only", "reduceOnly")):
             log_section("INFO", f"Close request ignored for {symbol}: {message}")
             return None
         raise
@@ -803,20 +764,17 @@ def load_system_prompt() -> str:
 
 
 def build_exchange() -> ccxt.Exchange:
-    api_key = os.getenv("TESTNET_API_KEY")
-    secret = os.getenv("TESTNET_SECRET_KEY")
+    """Build and return an authenticated Kraken Futures exchange instance."""
+    api_key = os.getenv("KRAKEN_API_KEY")
+    secret = os.getenv("KRAKEN_API_SECRET")
     if not api_key or not secret:
-        raise ValueError("TESTNET_API_KEY and TESTNET_SECRET_KEY must be set in .env")
+        raise ValueError("KRAKEN_API_KEY and KRAKEN_API_SECRET must be set in .env")
 
-    exchange = ccxt.binance({
+    exchange = ccxt.krakenfutures({
         "apiKey": api_key,
         "secret": secret,
         "enableRateLimit": True,
-        "options": {
-            "defaultType": "future",
-        },
     })
-    exchange.enable_demo_trading(True)
     exchange.load_markets()
     return exchange
 

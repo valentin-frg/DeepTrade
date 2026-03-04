@@ -427,19 +427,17 @@ def build_auditeur_prompt() -> str:
     btc_data: Optional[Dict] = None
     eth_data: Optional[Dict] = None
     sol_data: Optional[Dict] = None
-    bnb_data: Optional[Dict] = None
     xrp_data: Optional[Dict] = None
     doge_data: Optional[Dict] = None
     live_positions: Optional[Dict] = None
 
     try:
         exchange = build_exchange()
-        btc_data = _fetch_daily_ohlcv("BTC/USDT", exchange)
-        eth_data = _fetch_daily_ohlcv("ETH/USDT", exchange)
-        sol_data = _fetch_daily_ohlcv("SOL/USDT", exchange)
-        bnb_data = _fetch_daily_ohlcv("BNB/USDT", exchange)
-        xrp_data = _fetch_daily_ohlcv("XRP/USDT", exchange)
-        doge_data = _fetch_daily_ohlcv("DOGE/USDT", exchange)
+        btc_data = _fetch_daily_ohlcv("BTC/USD:USD", exchange)
+        eth_data = _fetch_daily_ohlcv("ETH/USD:USD", exchange)
+        sol_data = _fetch_daily_ohlcv("SOL/USD:USD", exchange)
+        xrp_data = _fetch_daily_ohlcv("XRP/USD:USD", exchange)
+        doge_data = _fetch_daily_ohlcv("DOGE/USD:USD", exchange)
         # Positions live pour le PnL flottant
         try:
             from prompt_builder import fetch_account_position_map
@@ -474,9 +472,6 @@ def build_auditeur_prompt() -> str:
     sol_open = _fmt_price(sol_data, "open")
     sol_close = _fmt_price(sol_data, "close")
     sol_chg = _fmt_price(sol_data, "change_percent")
-    bnb_open = _fmt_price(bnb_data, "open")
-    bnb_close = _fmt_price(bnb_data, "close")
-    bnb_chg = _fmt_price(bnb_data, "change_percent")
     xrp_open = _fmt_price(xrp_data, "open")
     xrp_close = _fmt_price(xrp_data, "close")
     xrp_chg = _fmt_price(xrp_data, "change_percent")
@@ -516,7 +511,6 @@ Net Daily P&L: {metrics['net_pnl_usdt']} USDT ({metrics['net_pnl_percent']}%)
 BTC Daily Open: {btc_open} | BTC Daily Close: {btc_close} | 24h Change: {btc_chg}%
 ETH Daily Open: {eth_open} | ETH Daily Close: {eth_close} | 24h Change: {eth_chg}%
 SOL Daily Open: {sol_open} | SOL Daily Close: {sol_close} | 24h Change: {sol_chg}%
-BNB Daily Open: {bnb_open} | BNB Daily Close: {bnb_close} | 24h Change: {bnb_chg}%
 XRP Daily Open: {xrp_open} | XRP Daily Close: {xrp_close} | 24h Change: {xrp_chg}%
 DOGE Daily Open: {doge_open} | DOGE Daily Close: {doge_close} | 24h Change: {doge_chg}%
 Major CRO (Sentinel) Alarms Triggered Today: {alarm_section}

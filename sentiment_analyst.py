@@ -14,7 +14,7 @@ from google.genai import types
 load_dotenv()
 
 SENTIMENT_CACHE_PATH = Path("sentiment_snapshot.json")
-COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "DOGE/USDT"]
+COINS = ["BTC/USD:USD", "ETH/USD:USD", "SOL/USD:USD", "XRP/USD:USD", "DOGE/USD:USD"]
 
 # Free RSS feeds from top crypto media — no API key required
 RSS_FEEDS = [
@@ -25,7 +25,7 @@ RSS_FEEDS = [
 ]
 
 _RELEVANT_KEYWORDS = {
-    "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "bnb", "xrp", "doge",
+    "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "doge",
     "crypto", "blockchain", "defi", "nft", "altcoin", "binance", "coinbase",
     "sec", "fed", "inflation", "cpi", "interest rate", "etf", "stablecoin",
     "liquidat", "whale", "open interest", "funding rate", "flash crash",
@@ -81,7 +81,6 @@ You must respond EXCLUSIVELY in valid JSON format, adhering strictly to the sche
     "BTC": {"bias": "BULLISH" | "BEARISH" | "NEUTRAL", "rationale": "..."},
     "ETH": {"bias": "BULLISH" | "BEARISH" | "NEUTRAL", "rationale": "..."},
     "SOL": {"bias": "BULLISH" | "BEARISH" | "NEUTRAL", "rationale": "..."},
-    "BNB": {"bias": "BULLISH" | "BEARISH" | "NEUTRAL", "rationale": "..."},
     "XRP": {"bias": "BULLISH" | "BEARISH" | "NEUTRAL", "rationale": "..."},
     "DOGE": {"bias": "BULLISH" | "BEARISH" | "NEUTRAL", "rationale": "..."}
   },
