@@ -299,6 +299,35 @@ h4 {
     box-shadow: 0 4px 24px rgba(124, 111, 255, 0.3);
 }
 
+.action-btn--danger {
+    background: rgba(220, 38, 38, 0.15);
+    color: #f87171;
+    border-color: rgba(220, 38, 38, 0.4);
+}
+
+.action-btn--danger:hover {
+    background: rgba(220, 38, 38, 0.3);
+    color: #fff;
+    border-color: #f87171;
+    box-shadow: 0 4px 20px rgba(220, 38, 38, 0.35);
+}
+
+.action-btn--kill {
+    background: rgba(185, 28, 28, 0.85);
+    color: #fff;
+    border-color: #dc2626;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    box-shadow: 0 4px 24px rgba(220, 38, 38, 0.5);
+    width: 100%;
+}
+
+.action-btn--kill:hover {
+    background: #dc2626;
+    box-shadow: 0 6px 32px rgba(220, 38, 38, 0.7);
+    transform: translateY(-1px);
+}
+
 /* ── Balances ────────────────────────────────────────────────────────────── */
 .balances {
     display: grid;

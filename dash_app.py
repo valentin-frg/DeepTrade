@@ -215,6 +215,64 @@ def manual_cycle() -> bool:
     return _start_cycle("Manual")
 
 
+def _kill_switch() -> str:
+    """
+    Emergency total shutdown:
+    1. Disable autoloop + remove cycle job.
+    2. Pause all APScheduler jobs (LLMs stop triggering).
+    3. Close every open position on Kraken.
+    Returns a human-readable status string.
+    """
+    # 1 — stop trading cycle
+    STATE.update(loop_enabled=False, loop_primed=False, grace_period_end=0)
+    configure_auto_cycle_job()
+
+    # 2 — pause ALL scheduler jobs (Sentiment, Sentinelle, Macro, Auditeur, Snapshot)
+    try:
+        SCHEDULER.pause()
+        LOGGER.critical("Kill switch activated: scheduler paused.")
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("Kill switch: could not pause scheduler: %s", exc)
+
+    # 3 — close all open positions
+    closed_coins: list[str] = []
+    close_errors: list[str] = []
+    try:
+        from prompt_builder import build_exchange, fetch_account_position_map, close_position
+        exchange = build_exchange()
+        positions = fetch_account_position_map(exchange)
+        if positions:
+            for coin, pos in positions.items():
+                try:
+                    close_position(exchange, pos["symbol"], pos["contracts"])
+                    closed_coins.append(coin)
+                    LOGGER.critical("Kill switch: closed position %s", coin)
+                except Exception as exc:  # noqa: BLE001
+                    close_errors.append(f"{coin}: {exc}")
+                    LOGGER.error("Kill switch: failed to close %s — %s", coin, exc)
+    except Exception as exc:  # noqa: BLE001
+        close_errors.append(f"Exchange error: {exc}")
+        LOGGER.error("Kill switch: exchange connection failed — %s", exc)
+
+    # Build status message
+    parts = ["⛔ KILL SWITCH ACTIVATED — All LLMs halted."]
+    if closed_coins:
+        parts.append(f"Closed positions: {', '.join(closed_coins)}.")
+    elif not close_errors:
+        parts.append("No open positions to close.")
+    if close_errors:
+        parts.append(f"Errors: {'; '.join(close_errors)}")
+
+    # 4 — signal run_bot.sh to NOT restart (intentional stop)
+    try:
+        Path(".stop_requested").touch()
+    except Exception:  # noqa: BLE001
+        pass
+
+    parts.append("Bot will not auto-restart. Close this terminal to fully stop.")
+    return " | ".join(parts)
+
+
 def auto_cycle_tick() -> None:
     # Refuse to run if emergency mode is active
     if is_emergency_active():
@@ -489,6 +547,45 @@ configure_snapshot_job()
 configure_sentiment_job()
 configure_macro_strategy_job()
 configure_auditeur_job()
+
+
+def _initialize_bot_state() -> None:
+    """
+    Create / update bot_state.json at dashboard startup.
+    Sets starting_capital from the real Kraken balance if not already recorded.
+    This ensures P&L tracking is accurate without requiring a first manual cycle.
+    """
+    from prompt_builder import build_exchange, save_state, load_state
+    state = load_state()
+    if "starting_capital" in state:
+        LOGGER.info(
+            "Bot state already initialised (starting_capital=%.2f).",
+            state["starting_capital"],
+        )
+        return
+    try:
+        exchange = build_exchange()
+        balance = exchange.fetch_balance()
+        _b = balance.get("total", {})
+        total = float(_b.get("USD") or _b.get("USDT") or 0)
+        try:
+            exchange.close()
+        except Exception:  # noqa: BLE001
+            pass
+        if total > 0:
+            state.setdefault("positions", {})
+            state.setdefault("leverage_applied", {})
+            state.setdefault("invocation_count", 0)
+            state["starting_capital"] = total
+            save_state(state)
+            LOGGER.info("Bot state initialised: starting_capital=%.2f USD", total)
+        else:
+            LOGGER.warning("Bot state init: balance is 0 — starting_capital not set yet.")
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("Bot state init failed: %s", exc)
+
+
+_initialize_bot_state()
 
 
 app = Dash(__name__)
@@ -843,13 +940,27 @@ app.layout = html.Div(
                                     ], className="status-cluster"),
                                     html.Div([
                                         html.Button("Start Trading Cycle", id="run-cycle-btn", n_clicks=0, className="action-btn action-btn--primary"),
+                                        html.Button("Stop Autoloop", id="stop-loop-btn", n_clicks=0, className="action-btn action-btn--danger"),
                                         html.Button("Refresh Snapshot", id="refresh-snapshot-btn", n_clicks=0, className="action-btn"),
                                     ], className="flex-gap-1", style={"marginTop": "1.5rem", "flexWrap": "wrap"}),
                                     html.Div(id="manual-cycle-feedback", className="feedback"),
+                                    html.Div(id="stop-loop-feedback", className="feedback"),
                                     html.Div(id="snapshot-feedback", className="feedback"),
                                     html.Div(id="cycle-hint", className="muted"),
                                     html.Div(id="next-snapshot-info", className="muted"),
                                 ], className="panel panel--control panel--wide"),
+
+                                html.Div([
+                                    html.H2("Kill Switch", style={"color": "#f87171", "marginBottom": "0.5rem", "fontSize": "1rem", "letterSpacing": "0.08em"}),
+                                    html.P("Stops ALL LLMs, cycles, and closes every open position on Kraken.",
+                                           style={"fontSize": "0.8rem", "color": "rgba(255,255,255,0.5)", "marginBottom": "1rem"}),
+                                    html.Button("⛔ KILL SWITCH — Halt All & Close Positions",
+                                                id="kill-switch-btn", n_clicks=0,
+                                                className="action-btn action-btn--kill"),
+                                    html.Div(id="kill-switch-feedback", className="feedback"),
+                                ], className="panel panel--control panel--wide",
+                                   style={"border": "1px solid rgba(220,38,38,0.3)",
+                                          "background": "rgba(220,38,38,0.05)"}),
 
                                 html.Div([
                                     html.H2("Account Overview"),
@@ -1031,6 +1142,28 @@ def handle_manual_cycle(n_clicks: int) -> str:
     if started:
         return "Manual trading cycle queued."
     return "Trading cycle already running."
+
+
+@app.callback(
+    Output("stop-loop-feedback", "children"),
+    Input("stop-loop-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def handle_stop_loop(n_clicks: int) -> str:
+    """Immediately disable the autoloop and remove the scheduled cycle job."""
+    STATE.update(loop_enabled=False, loop_primed=False, grace_period_end=0)
+    configure_auto_cycle_job()  # removes auto_cycle_job from scheduler
+    return "⏹ Autoloop stopped. The current cycle (if running) will finish, then no new cycle will start."
+
+
+@app.callback(
+    Output("kill-switch-feedback", "children"),
+    Input("kill-switch-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def handle_kill_switch(n_clicks: int) -> str:
+    """Total emergency shutdown: halt all LLMs and close all open positions."""
+    return _kill_switch()
 
 
 @app.callback(

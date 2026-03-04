@@ -375,10 +375,13 @@ def fetch_account_position_map(exchange: ccxt.Exchange) -> Dict[str, Dict[str, A
 
 def build_account_prompt(exchange: ccxt.Exchange, state: Dict[str, Any]) -> tuple[str, Dict[str, Dict[str, Any]], Dict[str, Any]]:
     balance = exchange.fetch_balance()
-    # Use CCXT-normalised balance fields (Kraken Futures compatible)
-    total_balance = float(balance.get("total", {}).get("USDT", 0))
-    available_cash = float(balance.get("free", {}).get("USDT", 0))
-    margin_balance = float(balance.get("used", {}).get("USDT", total_balance))
+    # Kraken Futures returns balances in USD (not USDT)
+    _base = balance.get("total", {})
+    total_balance = float(_base.get("USD") or _base.get("USDT") or 0)
+    _free = balance.get("free", {})
+    available_cash = float(_free.get("USD") or _free.get("USDT") or 0)
+    _used = balance.get("used", {})
+    margin_balance = float(_used.get("USD") or _used.get("USDT") or total_balance)
     starting_capital = state.get("starting_capital", 5000)
     pnl_percent = 0.0
     if starting_capital:

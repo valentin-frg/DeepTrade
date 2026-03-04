@@ -107,9 +107,10 @@ def emergency_shutdown(
 
     # Step 1 — Cancel all tracked SL/TP orders from state (faster than waiting for exchange)
     if state:
+        from prompt_builder import coin_to_symbol
         state_positions = state.get("positions", {})
         for coin, pos_data in state_positions.items():
-            symbol = f"{coin}/USDT"
+            symbol = coin_to_symbol(coin)
             for oid_key in ("sl_oid", "tp_oid"):
                 oid = pos_data.get(oid_key)
                 if oid and oid != -1:
