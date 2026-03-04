@@ -33,3 +33,4 @@ binance_testnet_public.pem
 # Local runtime state — regenerated automatically, never commit
 *.json
 *.tmp
+deeptrade.log

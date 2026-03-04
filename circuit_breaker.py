@@ -144,7 +144,7 @@ def emergency_shutdown(
                     side,
                     amount,
                     None,
-                    {"reduceOnly": True, "newOrderRespType": "RESULT"},
+                    {"reduceOnly": True},
                 )
                 LOGGER.critical(
                     "EMERGENCY CLOSE: %s %s %.6f → order %s",
