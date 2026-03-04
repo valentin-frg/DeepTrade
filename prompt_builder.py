@@ -532,8 +532,9 @@ def place_bracket_orders(
     orders = {"stop_loss": None, "take_profit": None}
     reduce_side = "sell" if side == "long" else "buy"
 
-    # Stop loss
+    # Stop loss — Kraken Futures requires 'triggerPrice' (not 'stopPrice')
     try:
+        sl_price = ensure_price_precision(exchange, symbol, stop_loss)
         sl_order = exchange.create_order(
             symbol,
             "stop_market",
@@ -541,7 +542,7 @@ def place_bracket_orders(
             amount,
             None,
             {
-                "stopPrice": ensure_price_precision(exchange, symbol, stop_loss),
+                "triggerPrice": sl_price,
                 "reduceOnly": True,
             },
         )
@@ -550,16 +551,17 @@ def place_bracket_orders(
     except Exception as exc:  # noqa: BLE001
         log_section("WARNING", f"Failed to place stop loss: {exc}")
 
-    # Take profit
+    # Take profit — krakenfutures does not support take_profit_market natively.
+    # A limit order at the TP price acts as a take profit: fills when market reaches TP.
     try:
+        tp_price = ensure_price_precision(exchange, symbol, take_profit)
         tp_order = exchange.create_order(
             symbol,
-            "take_profit_market",
+            "limit",
             reduce_side,
             amount,
-            None,
+            tp_price,
             {
-                "stopPrice": ensure_price_precision(exchange, symbol, take_profit),
                 "reduceOnly": True,
             },
         )
