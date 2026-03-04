@@ -30,16 +30,6 @@ binance_testnet_private.pem
 binance_testnet_public.pem
 *.pem
 
-# Local runtime state
-bot_state.json
-sentiment_snapshot.json
-sentiment_snapshot.tmp
-macro_strategy_cache.json
-macro_strategy_cache.tmp
-sentinelle_cache.json
-sentinelle_cache.tmp
-cycle_history.json
-cycle_history.tmp
-emergency_state.json
-emergency_state.tmp
-bot_state.json
+# Local runtime state — regenerated automatically, never commit
+*.json
+*.tmp
