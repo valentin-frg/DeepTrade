@@ -63,7 +63,7 @@ You must output a highly structured daily report strictly in Markdown, using the
 [Write 2-3 hard-hitting sentences summarizing the day's performance. Was it a success, a fee-drain, a technical failure, or a masterclass in capital preservation?]
 
 ## 2. Fee & Execution Analysis
-- **Gross vs Net:** [Brief analysis of how much of the profit was eaten by Binance fees].
+- **Gross vs Net:** [Brief analysis of how much of the profit was eaten by Kraken fees].
 - **Slippage & Duration:** [Are we holding trades long enough to justify the fees? Are we getting chopped out too fast?]
 
 ## 3. CIO Strategy Audit
@@ -297,7 +297,7 @@ def _compute_trade_metrics(
 
             trade_entries.append({
                 "trade_id": str(trade_id_counter),
-                "asset": f"{coin.upper()}USDT",
+                "asset": f"{coin.upper()}/USD:USD",
                 "direction": direction,
                 "leverage_used": f"{leverage}x" if leverage != "N/A" else "N/A",
                 "cio_rationale_at_entry": args.get("justification", "N/A")[:120] if args.get("justification") else "N/A",
@@ -366,10 +366,10 @@ def _format_open_positions(bot_state: Dict[str, Any], live_positions: Optional[D
         if live_positions and coin in live_positions:
             raw_pnl = live_positions[coin].get("unrealized_pnl")
             if raw_pnl is not None:
-                unrealized = f"{round(float(raw_pnl), 2)} USDT"
+                unrealized = f"{round(float(raw_pnl), 2)} USD"
 
         lines.append(
-            f"Asset: {coin}USDT | Direction: {direction} | Entry: {entry} | "
+            f"Asset: {coin}/USD:USD | Direction: {direction} | Entry: {entry} | "
             f"Leverage: {leverage}x | Current Floating P&L: {unrealized}"
         )
     return "\n".join(lines)
@@ -502,9 +502,9 @@ def build_auditeur_prompt() -> str:
     prompt = f"""DAILY TRADING OPERATIONS REPORT
 Date: {date_label} (00:00 UTC to 23:59 UTC)
 Account Type: LIVE REAL MONEY
-Starting Balance: {metrics['balance_start']} USDT
-Ending Balance: {metrics['balance_end']} USDT
-Net Daily P&L: {metrics['net_pnl_usdt']} USDT ({metrics['net_pnl_percent']}%)
+Starting Balance: {metrics['balance_start']} USD
+Ending Balance: {metrics['balance_end']} USD
+Net Daily P&L: {metrics['net_pnl_usdt']} USD ({metrics['net_pnl_percent']}%)
 
 --- SECTION 1: MACRO MARKET CONTEXT ---
 (To evaluate if our bot underperformed or outperformed the baseline market)
@@ -518,9 +518,9 @@ Major CRO (Sentinel) Alarms Triggered Today: {alarm_section}
 --- SECTION 2: COST & EFFICIENCY METRICS ---
 Total Trades Executed: {metrics['total_trades']}
 Win Rate: {metrics['win_rate_percent']}%
-Total Gross Profit: {metrics['gross_profit']} USDT
-Total Gross Loss: {metrics['gross_loss']} USDT
-TOTAL FEES PAID (Binance Taker/Maker): {metrics['total_fees_paid']}
+Total Gross Profit: {metrics['gross_profit']} USD
+Total Gross Loss: {metrics['gross_loss']} USD
+TOTAL FEES PAID (Kraken Taker/Maker): {metrics['total_fees_paid']}
 Average Slippage Estimated: {metrics['avg_slippage_percent']}
 
 --- SECTION 3: CLOSED TRADES LEDGER ---
