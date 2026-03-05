@@ -395,7 +395,7 @@ def _format_sentinelle_alarms(alarms: List[Dict[str, Any]], start: datetime, end
     if not triggered:
         return 0, ""
 
-    lines = []
+    blocks = []
     for a in triggered:
         ts_raw = a.get("timestamp", "")
         try:
@@ -403,9 +403,23 @@ def _format_sentinelle_alarms(alarms: List[Dict[str, Any]], start: datetime, end
             time_str = ts.strftime("%H:%M UTC")
         except Exception:  # noqa: BLE001
             time_str = ts_raw
-        reason = a.get("reasoning_for_logs", "N/A")[:120]
-        lines.append(f"  - {time_str}: {reason}")
-    return len(triggered), "\n".join(lines)
+
+        reasoning = a.get("reasoning_for_logs", "N/A")
+        message   = a.get("message_to_macro_strategist", "")
+        macro_resp = a.get("macro_strategist_response", "")
+        confidence = a.get("confidence_in_alarm", "?")
+
+        block = (
+            f"  [{time_str}] Confidence: {confidence}\n"
+            f"  Sentinelle reasoning:\n    {reasoning}\n"
+        )
+        if message:
+            block += f"  Emergency message to Macro Strategist:\n    {message}\n"
+        if macro_resp:
+            block += f"  Macro Strategist response:\n    {macro_resp}\n"
+        blocks.append(block)
+
+    return len(triggered), "\n".join(blocks)
 
 
 # ── Construction du prompt ────────────────────────────────────────────────────
@@ -685,6 +699,7 @@ def log_sentinelle_alarm(decision: Dict[str, Any]) -> None:
             "confidence_in_alarm": decision.get("confidence_in_alarm"),
             "reasoning_for_logs": decision.get("reasoning_for_logs", ""),
             "message_to_macro_strategist": decision.get("message_to_macro_strategist"),
+            "macro_strategist_response": None,  # filled by update_sentinelle_alarm_macro_response()
         }
         log.insert(0, entry)
         log = log[:500]
@@ -695,3 +710,26 @@ def log_sentinelle_alarm(decision: Dict[str, Any]) -> None:
         temp.replace(SENTINELLE_DAILY_LOG_PATH)
     except Exception as exc:  # noqa: BLE001
         print(f"[AUDITEUR] Erreur log Sentinelle : {exc}")
+
+
+def update_sentinelle_alarm_macro_response(macro_response: str) -> None:
+    """
+    Met à jour le dernier enregistrement d'alarme Sentinelle avec la réponse
+    du Macro Strategist. À appeler dans dash_app.py après fetch_and_cache_macro_strategy().
+    """
+    try:
+        if not SENTINELLE_DAILY_LOG_PATH.exists():
+            return
+        with SENTINELLE_DAILY_LOG_PATH.open("r", encoding="utf-8") as fh:
+            log: List[Dict[str, Any]] = json.load(fh)
+        if not log:
+            return
+        # Update the most recent entry (index 0) if it has no response yet
+        if log[0].get("trigger_recalculation") and log[0].get("macro_strategist_response") is None:
+            log[0]["macro_strategist_response"] = macro_response
+            temp = SENTINELLE_DAILY_LOG_PATH.with_suffix(".tmp")
+            with temp.open("w", encoding="utf-8") as fh:
+                json.dump(log, fh, indent=2, ensure_ascii=False)
+            temp.replace(SENTINELLE_DAILY_LOG_PATH)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[AUDITEUR] Erreur update macro response in Sentinelle log: {exc}")

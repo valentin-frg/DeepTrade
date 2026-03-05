@@ -42,7 +42,7 @@ from circuit_breaker import (
     get_emergency_info,
     clear_emergency,
 )
-from auditeur import run_auditeur, get_auditeur_history, log_sentinelle_alarm, append_to_daily_trade_log
+from auditeur import run_auditeur, get_auditeur_history, log_sentinelle_alarm, update_sentinelle_alarm_macro_response, append_to_daily_trade_log
 
 
 LOGGER = logging.getLogger("deeptrade.dash")
@@ -469,6 +469,13 @@ def sentiment_then_sentinelle_job() -> None:
                     next_run_time=datetime.now(timezone.utc) + timedelta(hours=1),
                 )
                 LOGGER.info("Macro strategy job rescheduled: next run in 1h from emergency trigger.")
+
+            # Store Macro Strategist's response in the alarm entry for the Auditeur
+            try:
+                macro_response = get_cached_macro_strategy() or ""
+                update_sentinelle_alarm_macro_response(macro_response)
+            except Exception as _upd_exc:  # noqa: BLE001
+                LOGGER.warning("Could not store macro response in alarm log: %s", _upd_exc)
 
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Sentinelle job failed: %s", exc)
