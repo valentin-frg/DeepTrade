@@ -17,6 +17,10 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from macro_strategist import get_cached_macro_strategy, MACRO_STRATEGIST_PROMPT
+from sentiment_analyst import get_cached_sentiment, SENTIMENT_SYSTEM_PROMPT
+from sentinelle import SENTINELLE_SYSTEM_PROMPT
+
 import requests
 from dotenv import load_dotenv
 
@@ -513,12 +517,46 @@ def build_auditeur_prompt() -> str:
     else:
         trades_section = json.dumps(closed_trades, indent=2, ensure_ascii=False)
 
+    # --- Section 0: LLM context (system prompts + live strategy/sentiment) ---
+    cio_system_prompt = Path("system_prompt.md").read_text(encoding="utf-8") if Path("system_prompt.md").exists() else "N/A"
+    macro_strategy_now = get_cached_macro_strategy() or "(no macro strategy in cache)"
+    sentiment_now = get_cached_sentiment() or "(no sentiment in cache)"
+
     prompt = f"""DAILY TRADING OPERATIONS REPORT
 Date: {date_label} (00:00 UTC to 23:59 UTC)
 Account Type: LIVE REAL MONEY
 Starting Balance: {metrics['balance_start']} USD
 Ending Balance: {metrics['balance_end']} USD
 Net Daily P&L: {metrics['net_pnl_usdt']} USD ({metrics['net_pnl_percent']}%)
+
+=== SECTION 0: LLM ARCHITECTURE & CONTEXT ===
+(This section gives you full visibility into each agent's mandate and the live context they operated with.)
+
+--- CIO — Chief Investment Officer (DeepSeek, executes trades) ---
+Role: Receives market data, account state, macro directive, and Gemini sentiment. Outputs trading signals in JSON (buy/sell/hold/close). Executes real orders on Kraken Futures.
+System Prompt:
+{cio_system_prompt}
+
+--- SENTINELLE — Chief Risk Officer (Gemini, monitors in real-time) ---
+Role: Runs every 5 minutes. Audits market conditions against the current positions. If it detects a black swan, geopolitical shock, or tactical hemorrhage it triggers an emergency macro recalculation.
+System Prompt:
+{SENTINELLE_SYSTEM_PROMPT}
+
+--- SENTIMENT ANALYST (Gemini, runs every 5 minutes) ---
+Role: Parses RSS crypto news feeds. Scores market sentiment per coin and raises black swan alerts when needed. Output fed to both CIO and Macro Strategist.
+System Prompt:
+{SENTIMENT_SYSTEM_PROMPT}
+
+--- MACRO STRATEGIST (Gemini, runs every 1 hour) ---
+Role: Translates macro market data + sentiment into a directional trading directive for the CIO. Can be overridden by Sentinelle in emergencies.
+System Prompt:
+{MACRO_STRATEGIST_PROMPT}
+
+--- LIVE MACRO STRATEGY (at time of this report) ---
+{macro_strategy_now}
+
+--- LIVE SENTIMENT (at time of this report) ---
+{sentiment_now}
 
 --- SECTION 1: MACRO MARKET CONTEXT ---
 (To evaluate if our bot underperformed or outperformed the baseline market)
