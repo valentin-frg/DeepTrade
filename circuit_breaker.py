@@ -125,8 +125,10 @@ def emergency_shutdown(
         raw_positions = exchange.fetch_positions()
         for entry in raw_positions:
             info = entry.get("info", {})
-            raw_amt = info.get("positionAmt")
-            contracts = float(raw_amt) if raw_amt is not None else float(entry.get("contracts") or 0)
+            # Use the CCXT-normalised "contracts" field — exchange-agnostic and
+            # correct for Kraken Futures. The old "positionAmt" field was a Binance
+            # raw payload artefact that always returned None on Kraken.
+            contracts = float(entry.get("contracts") or 0)
             if not contracts:
                 continue
 

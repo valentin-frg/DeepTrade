@@ -137,6 +137,46 @@ SCHEDULER.start()
 MANUAL_CYCLE_THREAD: Optional[threading.Thread] = None
 SNAPSHOT_LOCK = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Shared exchange instance for background analytics jobs
+# (Sentinelle, Macro Strategist, Snapshot).
+# Built once at startup — load_markets() is only called on first access or
+# after an error, instead of on every 5-minute job tick.
+# ---------------------------------------------------------------------------
+_SHARED_EXCHANGE: Optional[Any] = None
+_SHARED_EXCHANGE_LOCK = threading.Lock()
+
+
+def _get_shared_exchange():
+    """Return the shared authenticated Kraken Futures exchange instance.
+    Creates it on first call; raises on failure.
+    """
+    global _SHARED_EXCHANGE
+    with _SHARED_EXCHANGE_LOCK:
+        if _SHARED_EXCHANGE is None:
+            try:
+                _SHARED_EXCHANGE = build_exchange()
+                LOGGER.info("Shared exchange initialised (load_markets done).")
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("Could not initialise shared exchange: %s", exc)
+                raise
+        return _SHARED_EXCHANGE
+
+
+def _reset_shared_exchange() -> None:
+    """Force-rebuild the shared exchange on the next call.
+    Call this after an unrecoverable API error on the shared instance.
+    """
+    global _SHARED_EXCHANGE
+    with _SHARED_EXCHANGE_LOCK:
+        if _SHARED_EXCHANGE is not None:
+            try:
+                _SHARED_EXCHANGE.close()
+            except Exception:  # noqa: BLE001
+                pass
+        _SHARED_EXCHANGE = None
+        LOGGER.info("Shared exchange reset — will reconnect on next use.")
+
 
 def _format_local_timestamp(ts: datetime) -> str:
     if ts.tzinfo is None:
@@ -396,28 +436,112 @@ def configure_snapshot_job() -> None:
             SCHEDULER.remove_job("snapshot_refresh_job")
 
 
+def _check_macro_invalidation_price(exchange, market_data: str, account_prompt: str, sentiment: str) -> None:
+    """
+    Check whether the current BTC price has breached the macro strategy's
+    invalidation_price circuit-breaker.  If so, trigger an immediate emergency
+    macro recalculation — analogous to what the Sentinelle does, but driven by
+    the price crossing the CMS's own hard stop rather than the CRO's discretion.
+
+    Called every 5 minutes from sentiment_then_sentinelle_job().
+    """
+    macro_json_str = get_cached_macro_strategy()
+    if not macro_json_str:
+        return
+
+    try:
+        # Strip any leading/trailing prose the macro might have added
+        raw = macro_json_str.strip()
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        macro = json.loads(raw[start:end])
+    except Exception:  # noqa: BLE001
+        return
+
+    risk = macro.get("risk_management", {})
+    invalidation_price = risk.get("invalidation_price")
+    bias = macro.get("bias", "NEUTRAL")
+
+    if not invalidation_price or bias == "NEUTRAL":
+        return  # No circuit-breaker to check for neutral stances
+
+    try:
+        ticker = exchange.fetch_ticker("BTC/USD:USD")
+        btc_price = float(ticker.get("last") or ticker.get("close") or 0)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Could not fetch BTC price for invalidation check: %s", exc)
+        return
+
+    if not btc_price:
+        return
+
+    invalidation_price = float(invalidation_price)
+    breached = (
+        (bias == "LONG" and btc_price < invalidation_price)
+        or (bias == "SHORT" and btc_price > invalidation_price)
+    )
+
+    if not breached:
+        return
+
+    direction = "dropped below" if bias == "LONG" else "risen above"
+    emergency_note = (
+        f"⚠️ MACRO INVALIDATION PRICE REACHED — EMERGENCY RECALCULATION REQUIRED\n"
+        f"The current BTC price ({btc_price:,.2f} USD) has {direction} the invalidation "
+        f"price you defined ({invalidation_price:,.2f} USD) for the {bias} macro thesis.\n"
+        f"Your previous strategy is now mathematically invalidated. You MUST define a new "
+        f"directional thesis from scratch, ignoring your previous bias entirely.\n"
+        f"Consider: is this a genuine trend reversal, a liquidity sweep, or a temporary "
+        f"anomaly? Size your confidence accordingly."
+    )
+
+    LOGGER.warning(
+        "Macro invalidation_price breached! BTC=%.2f vs threshold=%.2f (bias=%s). "
+        "Triggering emergency macro recalculation.",
+        btc_price,
+        invalidation_price,
+        bias,
+    )
+
+    fetch_and_cache_macro_strategy(
+        market_data,
+        account_prompt,
+        sentiment,
+        emergency_note=emergency_note,
+    )
+
+    # Reset hourly macro scheduler — fresh 1h window after the recalculation
+    macro_job = SCHEDULER.get_job("macro_strategy_job")
+    if macro_job:
+        SCHEDULER.reschedule_job(
+            "macro_strategy_job",
+            trigger=IntervalTrigger(hours=1),
+            next_run_time=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        LOGGER.info("Macro strategy job rescheduled after invalidation_price breach.")
+
+
 def sentiment_then_sentinelle_job() -> None:
     """
     Wrapper scheduled every 5 minutes:
     1. Refresh the sentiment cache (Gemini + Google Search).
     2. Run La Sentinelle (CRO audit).
     3. If the Sentinelle triggers a recalculation, immediately run the macro strategist.
+    4. Check if the macro invalidation_price has been breached (independent circuit-breaker).
     """
     # Step 1 — refresh sentiment
     _fetch_sentiment()
 
     # Step 2 — audit with La Sentinelle
     try:
-        exchange = build_exchange()
+        exchange = _get_shared_exchange()
         state = load_state()
         try:
             market_data = build_market_prompt(exchange)
             account_prompt, _, _ = build_account_prompt(exchange, state)
-        finally:
-            try:
-                exchange.close()
-            except Exception:  # noqa: BLE001
-                pass
+        except Exception:
+            _reset_shared_exchange()  # Force reconnect on next job tick
+            raise
 
         sentiment = get_cached_sentiment()
         macro_strategy = get_cached_macro_strategy()
@@ -438,6 +562,7 @@ def sentiment_then_sentinelle_job() -> None:
             market_data=sentinelle_market,
             sentiment=sentiment,
             macro_strategy=macro_strategy,
+            account_prompt=account_prompt,
         )
 
         # Log the alarm for the Auditeur's daily report
@@ -477,6 +602,13 @@ def sentiment_then_sentinelle_job() -> None:
             except Exception as _upd_exc:  # noqa: BLE001
                 LOGGER.warning("Could not store macro response in alarm log: %s", _upd_exc)
 
+        # Step 4 — independent invalidation_price circuit-breaker
+        # (runs even if Sentinelle did not trigger, as a separate safety layer)
+        try:
+            _check_macro_invalidation_price(exchange, market_data, account_prompt, sentiment)
+        except Exception as _inv_exc:  # noqa: BLE001
+            LOGGER.warning("Invalidation price check failed: %s", _inv_exc)
+
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Sentinelle job failed: %s", exc)
 
@@ -497,16 +629,14 @@ def configure_sentiment_job() -> None:
 def macro_strategy_job() -> None:
     """Wrapper executed by the scheduler: builds live market data and calls the macro strategist."""
     try:
-        exchange = build_exchange()
+        exchange = _get_shared_exchange()
         state = load_state()
         try:
             market_data = build_market_prompt(exchange)
             account_prompt, _, _ = build_account_prompt(exchange, state)
-        finally:
-            try:
-                exchange.close()
-            except Exception:  # noqa: BLE001
-                pass
+        except Exception:
+            _reset_shared_exchange()  # Force reconnect on next job tick
+            raise
         sentiment = get_cached_sentiment()
         fetch_and_cache_macro_strategy(market_data, account_prompt, sentiment)
     except Exception as exc:  # noqa: BLE001

@@ -13,8 +13,8 @@ load_dotenv()
 
 MACRO_STRATEGY_CACHE_PATH = Path("macro_strategy_cache.json")
 
-MACRO_STRATEGIST_PROMPT = """You are the Chief Quantitative Strategist (Chief Investment Officer) of an elite crypto hedge fund. Your exclusive role is to analyze global market data and define the trading strategy for the next hour.
-You do not place orders directly. You dictate directives to your Tactical Execution Agent, a high-frequency algorithm operating on 1-minute charts (M1). Your agent is forbidden from contradicting your bias — it will only seek the best M1 entry point based on your rules.
+MACRO_STRATEGIST_PROMPT = """You are the Chief Macro Strategist (CMS) of an elite crypto hedge fund. Your exclusive role is to analyze global market data and define the trading strategy for the next hour.
+You do not place orders directly. You dictate directives to your Tactical Execution Agent, a high-frequency algorithm operating on 5-minute charts (M5). Your agent is forbidden from contradicting your bias — it will only seek the best M5 entry point based on your rules.
 
 OPERATING CYCLE:
 - Under normal conditions, you define a new strategy ONCE PER HOUR. Your directive governs the entire hour and the Tactical Agent executes within your framework.
@@ -90,7 +90,7 @@ def fetch_and_cache_macro_strategy(market_data: str, account_data: str, sentimen
         # Use the best available Gemini model for deep strategic reasoning
         config = types.GenerateContentConfig(
             system_instruction=MACRO_STRATEGIST_PROMPT,
-            thinking_config=types.ThinkingConfig(thinking_budget=-1),
+            thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
         )
 
         response = client.models.generate_content(

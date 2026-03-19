@@ -33,8 +33,8 @@ from circuit_breaker import is_emergency_active, emergency_shutdown
 COINS = ["BTC/USD:USD", "ETH/USD:USD", "SOL/USD:USD", "XRP/USD:USD", "DOGE/USD:USD"]
 INTRADAY_TIMEFRAME = "5m"  # Kraken: 1m 5m 15m 30m 1h 4h 12h 1d 1w (no 3m)
 LONGTERM_TIMEFRAME = "4h"
-INTRADAY_BARS = 10
-LONGTERM_BARS = 10
+INTRADAY_BARS = 30
+LONGTERM_BARS = 20
 SYSTEM_PROMPT_FILENAME = "system_prompt.md"
 STATE_PATH = Path("bot_state.json")
 SENTIMENT_CACHE_PATH = SENTIMENT_CACHE_PATH  # re-exported from sentiment_analyst
@@ -43,8 +43,11 @@ MAX_DEEPSEEK_RETRIES = 3
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-chat"
 
-# deepseek-chat is much faster and doesn't produce chain-of-thought
-DEEPSEEK_MAX_TOKENS = 2048
+# deepseek-chat is much faster and doesn't produce chain-of-thought.
+# 8192 is the absolute output limit for deepseek-chat; setting it here
+# prevents truncation without affecting response time (the model stops
+# as soon as it finishes, not when it hits the limit).
+DEEPSEEK_MAX_TOKENS = 8192
 DEEPSEEK_TIMEOUT = 300  # seconds
 
 load_dotenv()
@@ -246,6 +249,8 @@ def build_market_prompt(exchange: ccxt.Exchange) -> str:
         open_interest_avg = None
         funding_rate = None
         if public_derivatives:
+            # Open Interest — independent try/except per coin so that a failure
+            # on one coin does not silently skip all subsequent coins.
             if hasattr(public_derivatives, "fetch_open_interest_history"):
                 try:
                     oi_history = public_derivatives.fetch_open_interest_history(symbol, limit=10)
@@ -257,13 +262,19 @@ def build_market_prompt(exchange: ccxt.Exchange) -> str:
                     if amounts:
                         open_interest_latest = amounts[-1]
                         open_interest_avg = sum(amounts) / len(amounts)
-                except Exception as exc:  # noqa: BLE001
+                except Exception:  # noqa: BLE001
+                    # Invalidate both the local variable AND the function attribute
+                    # so the instance is rebuilt on the next build_market_prompt() call.
+                    build_market_prompt._public_derivatives = None
                     public_derivatives = None
+
+            # Funding Rate — independent from OI: fetched even if OI failed above.
             if public_derivatives:
                 try:
                     funding_info = public_derivatives.fetch_funding_rate(symbol)
                     funding_rate = funding_info.get("fundingRate")
-                except Exception as exc:  # noqa: BLE001
+                except Exception:  # noqa: BLE001
+                    build_market_prompt._public_derivatives = None
                     public_derivatives = None
 
         for df in (intraday_df, longterm_df):
@@ -302,7 +313,7 @@ def build_market_prompt(exchange: ccxt.Exchange) -> str:
         if funding_rate is not None:
             coin_prompt += f"Funding Rate: {funding_rate}\n"
 
-        coin_prompt += "Intraday series (by minute, oldest → latest):\n"
+        coin_prompt += f"Intraday series ({INTRADAY_BARS} × {INTRADAY_TIMEFRAME} candles, oldest → latest):\n"
         coin_prompt += f"Mid prices: {intraday_series['close'].tolist()}\n"
         coin_prompt += f"High prices: {intraday_series['high'].tolist()}\n"
         coin_prompt += f"Low prices: {intraday_series['low'].tolist()}\n"
@@ -373,7 +384,11 @@ def fetch_account_position_map(exchange: ccxt.Exchange) -> Dict[str, Dict[str, A
     return positions
 
 
-def build_account_prompt(exchange: ccxt.Exchange, state: Dict[str, Any]) -> tuple[str, Dict[str, Dict[str, Any]], Dict[str, Any]]:
+def build_account_prompt(
+    exchange: ccxt.Exchange,
+    state: Dict[str, Any],
+    positions_map: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> tuple[str, Dict[str, Dict[str, Any]], Dict[str, Any]]:
     balance = exchange.fetch_balance()
     # Kraken Futures returns balances in USD (not USDT)
     _base = balance.get("total", {})
@@ -387,7 +402,9 @@ def build_account_prompt(exchange: ccxt.Exchange, state: Dict[str, Any]) -> tupl
     if starting_capital:
         pnl_percent = ((total_balance - starting_capital) / starting_capital) * 100
 
-    positions_map = fetch_account_position_map(exchange)
+    # Reuse pre-fetched positions if provided (avoids a redundant HTTP call)
+    if positions_map is None:
+        positions_map = fetch_account_position_map(exchange)
     state_positions = state.setdefault("positions", {})
 
     positions_str_chunks = []
@@ -705,6 +722,18 @@ def process_decisions(
             stop_loss = float(raw_stop)
             target = float(raw_target)
             risk_pct = float(raw_risk_pct)
+
+            # Guard: enforce the 1% minimum SL distance stated in the system prompt.
+            # A tighter SL produces an oversized position that may blow the margin.
+            sl_distance_pct = abs(price - stop_loss) / price
+            if sl_distance_pct < 0.01:
+                log_section(
+                    "WARNING",
+                    f"Stop loss for {coin} rejected: distance {sl_distance_pct:.2%} "
+                    f"is below the 1% minimum (entry={price}, SL={stop_loss}). Skipping entry.",
+                )
+                continue
+
             total_balance = float(balances.get("total_balance", 0))
             risk_usd = total_balance * risk_pct / 100.0
 
@@ -849,7 +878,10 @@ def run_cycle() -> RunCycleResult:
         reconcile_state(state, live_positions_check)
         # --------------------------------------------------------------------------
 
-        account_prompt_before, positions_before, balances_before = build_account_prompt(exchange, state)
+        # Reuse live_positions_check — no second fetch_positions() call needed
+        account_prompt_before, positions_before, balances_before = build_account_prompt(
+            exchange, state, positions_map=live_positions_check
+        )
         qualitative_info = get_cached_sentiment()
 
         if "starting_capital" not in state:
@@ -865,8 +897,24 @@ def run_cycle() -> RunCycleResult:
         ).format(minutes=minutes_since_start, now=current_time, count=invocation_count)
         macro_directive = get_cached_macro_strategy()
         if macro_directive:
+            # Extract generation timestamp so the CIO knows how stale this directive is
+            _macro_ts = "unknown"
+            try:
+                _macro_data = json.loads(macro_directive.strip())
+                _macro_ts = _macro_data.get("timestamp_analysis", "unknown")
+            except Exception:  # noqa: BLE001
+                pass
+            user_prompt += f"[MACRO STRATEGY — generated at: {_macro_ts} | refreshed every 1h or on emergency]\n"
             user_prompt += macro_directive + "\n"
         if qualitative_info:
+            # Extract generation timestamp so the CIO knows how stale the sentiment is
+            _sent_ts = "unknown"
+            try:
+                _sent_data = json.loads(qualitative_info.strip())
+                _sent_ts = _sent_data.get("timestamp_analysis", "unknown")
+            except Exception:  # noqa: BLE001
+                pass
+            user_prompt += f"[SENTIMENT ANALYSIS — generated at: {_sent_ts} | refreshed every 5min]\n"
             user_prompt += qualitative_info + "\n"
         user_prompt += market_prompt
         user_prompt += "\n"

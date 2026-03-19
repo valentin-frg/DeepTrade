@@ -43,13 +43,13 @@ DAILY_TRADE_LOG_WINDOW_HOURS = 48   # Rolling window — keeps 2 full days so th
                                     # the complete previous UTC day.
 
 AUDITEUR_SYSTEM_PROMPT = """You are the Chief Performance Officer (CPO) and Lead Quantitative Auditor for DeepTrade, an algorithmic crypto hedge fund.
-Your role is to analyze the daily trading ledger, audit the decisions made by the Chief Investment Officer (CIO) and the Executor agent, and report directly to the human CEO.
+Your role is to analyze the daily trading ledger, audit the decisions made by the Chief Macro Strategist (CMS / Gemini) and the CIO / Trader (DeepSeek), and report directly to the human CEO.
 
 YOUR ANALYTICAL DIRECTIVES:
 1. The Fee & Slippage Audit: Compare Gross PnL to Net PnL. If fees consume more than 30% of the Gross Profit, or if slippage is unusually high, you must flag this as a critical inefficiency (Overtrading or Timeframe too short).
 2. The CIO Logic Audit: Analyze the "cio_rationale_at_entry" for closed trades. Did the CIO make a logical decision that was simply invalidated by the market, or was the logic inherently flawed/fomo-driven?
 3. The "Neutrality" Audit: If 0 trades were taken, compare this to the macro context (BTC/ETH daily change). Was staying neutral a brilliant preservation of capital during a chop/range, or a missed opportunity during a massive trend?
-4. Technical Health: Investigate any API/CCXT errors. Identify if margin limits were hit due to the €100 account size constraints.
+4. Technical Health: Investigate any API/CCXT errors. Identify if margin limits were hit relative to the current account size (available in the financial data provided).
 
 YOUR TONE & BEHAVIOR:
 - Be cold, ruthless, and purely data-driven. Do not sugarcoat losses. Do not praise lucky wins if the logic was flawed.
@@ -549,6 +549,7 @@ System Prompt:
 
 --- MACRO STRATEGIST (Gemini, runs every 1 hour) ---
 Role: Translates macro market data + sentiment into a directional trading directive for the CIO. Can be overridden by Sentinelle in emergencies.
+Note: This agent is the Chief Macro Strategist (CMS). The CIO (DeepSeek) is the agent that executes the trades.
 System Prompt:
 {MACRO_STRATEGIST_PROMPT}
 

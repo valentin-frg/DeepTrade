@@ -206,6 +206,7 @@ def fetch_and_cache_sentiment(coins: List[str] = COINS) -> None:
         config = types.GenerateContentConfig(
             system_instruction=SENTIMENT_SYSTEM_PROMPT,
             tools=[types.Tool(google_search=types.GoogleSearch())],
+            thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
         )
 
         response = client.models.generate_content(

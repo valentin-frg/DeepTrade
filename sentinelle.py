@@ -17,10 +17,10 @@ CYCLE_HISTORY_PATH = Path("cycle_history.json")
 
 SENTINELLE_SYSTEM_PROMPT = """You are the Chief Risk Officer (CRO), the risk audit AI of an elite quantitative hedge fund. Your role is critical: you are the capital's last line of defense.
 
-Every 5 minutes, you receive a report on market conditions, the latest news, the performance of the Execution Agent (which trades on a 1-minute basis), and the current Macro Strategy (dictated by the CIO for the current hour).
+Every 5 minutes, you receive a structured situation report containing: (1) the current Macro Strategy, (2) the Execution Agent's recent performance history, (3) live market data (price, indicators), (4) the latest news sentiment, and (5) the real-time account state — including open positions, their entry prices, unrealized PnL, and current mark prices. Use section 5 to assess whether any open positions are already in severe drawdown, which is a key signal for a Tactical Hemorrhage alarm.
 
 YOUR MISSION:
-Decide whether the current context invalidates the ongoing macroeconomic strategy. If so, you must trigger the alarm to force the CIO to urgently recalculate a new strategy.
+Decide whether the current context invalidates the ongoing macroeconomic strategy. If so, you must trigger the alarm to force the Trader to urgently recalculate a new strategy.
 
 INTERVENTION RULES (Only trigger the alarm in these cases):
 1. Fundamental Shock (News): A major policy, economic, or geopolitical event has just emerged (e.g., SEC announcement, exchange bankruptcy, influential presidential statement) that directly contradicts the current strategy.
@@ -38,7 +38,7 @@ Required structure:
   "trigger_recalculation": true | false,
   "confidence_in_alarm": [integer from 0 to 100],
   "reasoning_for_logs": "Short, technical explanation of your decision for our internal logs. If false, explain why the situation is normal.",
-  "message_to_macro_strategist": "If trigger_recalculation is true, write an urgent message to the CIO explaining what has changed and what must be factored into the recalculation. If false, set to null."
+  "message_to_macro_strategist": "If trigger_recalculation is true, write an urgent message to the Trader explaining what has changed and what must be factored into the recalculation. If false, set to null."
 }"""
 
 
@@ -88,10 +88,16 @@ def build_sentinelle_prompt(
     macro_strategy: str,
     market_data: str,
     cycles: Optional[List[Dict[str, Any]]] = None,
+    account_prompt: Optional[str] = None,
 ) -> str:
     """Assemble the user prompt sent to the Sentinelle."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     cycle_summary = _summarise_cycles(cycles or [])
+
+    account_section = (
+        f"5. LIVE POSITIONS & ACCOUNT STATE (real-time):\n"
+        f"{account_prompt.strip()}\n\n"
+    ) if account_prompt else ""
 
     return (
         f"SITUATION REPORT — RISK AUDIT (5-MINUTE CYCLE)\n"
@@ -104,6 +110,7 @@ def build_sentinelle_prompt(
         f"{market_data.strip()}\n\n"
         f"4. LIVE NEWS FEED (Urgency / Sentiment):\n"
         f"{sentiment.strip() if sentiment else 'No sentiment data available.'}\n\n"
+        f"{account_section}"
         f"ANALYSIS REQUIRED:\n"
         f"Based on this data, is the current macro strategy still safe and consistent with market reality?\n"
         f"Generate your response immediately in strict JSON format."
@@ -114,6 +121,7 @@ def run_sentinelle(
     market_data: str,
     sentiment: str,
     macro_strategy: str,
+    account_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Call the Sentinelle (CRO) AI with the latest market context.
@@ -124,7 +132,7 @@ def run_sentinelle(
         return {"trigger_recalculation": False, "reasoning_for_logs": "GEMINI_API_KEY not set."}
 
     cycles = _load_cycle_history()
-    user_prompt = build_sentinelle_prompt(sentiment, macro_strategy, market_data, cycles)
+    user_prompt = build_sentinelle_prompt(sentiment, macro_strategy, market_data, cycles, account_prompt)
 
     try:
         client = genai.Client(api_key=api_key)
@@ -136,6 +144,7 @@ def run_sentinelle(
         ]
         config = types.GenerateContentConfig(
             system_instruction=SENTINELLE_SYSTEM_PROMPT,
+            thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
         )
         response = client.models.generate_content(
             model="gemini-3.1-pro-preview",
